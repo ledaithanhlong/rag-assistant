@@ -3,22 +3,40 @@ import { ai, CHAT_MODEL, embedText } from '../../../lib/geminiClient';
 
 export async function POST(request) {
   try {
-    const { question } = await request.json();
+    const { question, sessionId } = await request.json();
     if (!question) {
       return new Response(JSON.stringify({ error: 'Thiếu câu hỏi.' }), { status: 400 });
     }
+    if (!sessionId) {
+      return new Response(JSON.stringify({ error: 'Thiếu sessionId.' }), { status: 400 });
+    }
 
-    // 1. Biến câu hỏi thành vector
+    // Lưu câu hỏi của người dùng ngay lập tức
+    await supabaseAdmin.from('chat_messages').insert({
+      session_id: sessionId,
+      role: 'user',
+      content: question,
+    });
+
+    // Nếu session chưa có tiêu đề, đặt luôn theo câu hỏi đầu tiên
+    const { data: session } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('title')
+      .eq('id', sessionId)
+      .single();
+    if (session && !session.title) {
+      const title = question.length > 60 ? question.slice(0, 60) + '…' : question;
+      await supabaseAdmin.from('chat_sessions').update({ title }).eq('id', sessionId);
+    }
+
     const queryEmbedding = await embedText(question, 'RETRIEVAL_QUERY');
 
-    // 2. Tìm các đoạn tài liệu liên quan nhất trong Supabase (pgvector)
     const { data: matches, error } = await supabaseAdmin.rpc('match_chunks', {
       query_embedding: queryEmbedding,
       match_count: 5,
     });
     if (error) throw error;
 
-    // 2b. Lấy tên file gốc cho từng đoạn, để hiển thị nguồn dễ hiểu hơn
     const docIds = [...new Set((matches || []).map((m) => m.document_id))];
     let docTitleMap = {};
     if (docIds.length > 0) {
@@ -31,6 +49,8 @@ export async function POST(request) {
 
     const sources = (matches || []).map((m) => ({
       title: docTitleMap[m.document_id] || 'Không rõ tài liệu',
+      page: m.page || null,
+      chunkOrder: m.chunk_order,
       snippet: m.content.length > 280 ? m.content.slice(0, 280) + '…' : m.content,
     }));
 
@@ -46,7 +66,6 @@ Có thể dùng markdown cơ bản: in đậm bằng **, gạch đầu dòng b�
 Các đoạn tài liệu liên quan:
 ${context || '(không tìm thấy đoạn nào liên quan)'}`;
 
-    // 3. Gọi Gemini để trả lời, dùng streaming để chữ chạy dần
     const stream = await ai.models.generateContentStream({
       model: CHAT_MODEL,
       contents: question,
@@ -54,20 +73,36 @@ ${context || '(không tìm thấy đoạn nào liên quan)'}`;
     });
 
     const encoder = new TextEncoder();
+    let fullAnswer = '';
+
     const readable = new ReadableStream({
       async start(controller) {
         for await (const chunk of stream) {
           const delta = chunk.text || '';
-          if (delta) controller.enqueue(encoder.encode(delta));
+          if (delta) {
+            fullAnswer += delta;
+            controller.enqueue(encoder.encode(delta));
+          }
         }
         controller.close();
+
+        // Lưu câu trả lời đầy đủ + nguồn sau khi stream xong
+        await supabaseAdmin.from('chat_messages').insert({
+          session_id: sessionId,
+          role: 'assistant',
+          content: fullAnswer,
+          sources,
+        });
+        await supabaseAdmin
+          .from('chat_sessions')
+          .update({ updated_at: new Date().toISOString() })
+          .eq('id', sessionId);
       },
     });
 
     return new Response(readable, {
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
-        // Gửi kèm thông tin nguồn qua header, client sẽ đọc trước khi stream text
         'X-Sources': encodeURIComponent(JSON.stringify(sources)),
       },
     });

@@ -4,8 +4,8 @@ import { supabaseAdmin } from '../../../lib/supabaseAdmin';
 export async function GET() {
   const { data, error } = await supabaseAdmin
     .from('documents')
-    .select('id, title, created_at')
-    .order('created_at', { ascending: false });
+    .select('id, title, hidden, sort_order, created_at')
+    .order('sort_order', { ascending: true });
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
@@ -14,7 +14,16 @@ export async function GET() {
 }
 
 export async function DELETE(request) {
-  const { id } = await request.json();
+  const body = await request.json();
+
+  if (body.all) {
+    // Xóa toàn bộ tài liệu (và chunks liên quan qua cascade)
+    const { error } = await supabaseAdmin.from('documents').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ success: true });
+  }
+
+  const { id } = body;
   if (!id) {
     return NextResponse.json({ error: 'Thiếu id tài liệu.' }, { status: 400 });
   }

@@ -1,10 +1,11 @@
 import pdfParse from 'pdf-parse';
 import { supabaseAdmin } from '../../../lib/supabaseAdmin';
-import { chunkText } from '../../../lib/chunk';
-import { embedText } from '../../../lib/geminiClient';
+import { chunkText, chunkPages } from '../../../lib/chunk';
+import { embedText, ocrImage } from '../../../lib/geminiClient';
+import { docxToHtmlAndText, htmlToPdfBuffer, imageToPdfBuffer } from '../../../lib/convertToPdf';
 
-// Trả về dạng stream NDJSON: mỗi dòng là 1 object JSON báo tiến trình.
-// Client đọc từng dòng để cập nhật % theo thời gian thực, thay vì chờ xong mới biết.
+const IMAGE_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg' };
+
 export async function POST(request) {
   const encoder = new TextEncoder();
 
@@ -14,10 +15,11 @@ export async function POST(request) {
         controller.enqueue(encoder.encode(JSON.stringify(obj) + '\n'));
       }
 
+      let docId = null;
+
       try {
         const formData = await request.formData();
         const file = formData.get('file');
-
         if (!file) {
           send({ type: 'error', message: 'Không có file nào được gửi lên.' });
           controller.close();
@@ -25,38 +27,93 @@ export async function POST(request) {
         }
 
         const buffer = Buffer.from(await file.arrayBuffer());
-        let text = '';
-        const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+        const lowerName = file.name.toLowerCase();
+        const isPdf = file.type === 'application/pdf' || lowerName.endsWith('.pdf');
+        const isDocx = lowerName.endsWith('.docx');
+        const isImage = !!IMAGE_TYPES[file.type] || /\.(png|jpe?g)$/i.test(lowerName);
+
+        let chunks = [];
+        let fullText = '';
+        let pdfBuffer = null; // buffer để lưu lên Storage cho việc xem lại
+
+        send({ type: 'status', message: 'Đang trích xuất nội dung...' });
 
         if (isPdf) {
-          const parsed = await pdfParse(buffer);
-          text = parsed.text;
+          const pageTexts = [];
+          await pdfParse(buffer, {
+            pagerender: async (pageData) => {
+              const textContent = await pageData.getTextContent();
+              const text = textContent.items.map((item) => item.str).join(' ');
+              pageTexts.push(text);
+              return text;
+            },
+          });
+          fullText = pageTexts.join('\n\n');
+          chunks = chunkPages(pageTexts);
+          pdfBuffer = buffer; // đã là PDF sẵn, dùng luôn để xem lại
+
+        } else if (isDocx) {
+          send({ type: 'status', message: 'Đang chuyển .docx sang PDF...' });
+          const { html, text } = await docxToHtmlAndText(buffer);
+          fullText = text;
+          chunks = chunkText(fullText);
+          pdfBuffer = await htmlToPdfBuffer(html);
+
+        } else if (isImage) {
+          send({ type: 'status', message: 'Đang nhận diện chữ trong ảnh (OCR)...' });
+          const mimeType = file.type || (lowerName.endsWith('.png') ? 'image/png' : 'image/jpeg');
+          fullText = await ocrImage(buffer, mimeType);
+          chunks = chunkText(fullText || '(không nhận diện được chữ trong ảnh)');
+          pdfBuffer = await imageToPdfBuffer(buffer, mimeType);
+
         } else {
-          text = buffer.toString('utf-8');
+          // .txt, .md
+          fullText = buffer.toString('utf-8');
+          chunks = chunkText(fullText);
         }
 
-        if (!text.trim()) {
+        if (!fullText.trim()) {
           send({ type: 'error', message: 'Không trích xuất được nội dung từ file này.' });
           controller.close();
           return;
         }
 
+        // Tạo document trước để có id, dùng id đó đặt tên file trên Storage
         const { data: doc, error: docError } = await supabaseAdmin
           .from('documents')
-          .insert({ title: file.name })
+          .insert({ title: file.name, content: fullText })
           .select()
           .single();
-
         if (docError) throw docError;
+        docId = doc.id;
 
-        const chunks = chunkText(text);
+        if (pdfBuffer) {
+          send({ type: 'status', message: 'Đang lưu bản PDF để xem lại...' });
+          const storagePath = `${doc.id}.pdf`;
+          const { error: storageError } = await supabaseAdmin.storage
+            .from('document-files')
+            .upload(storagePath, pdfBuffer, { contentType: 'application/pdf', upsert: true });
+          if (storageError) throw storageError;
+
+          const { data: publicUrlData } = supabaseAdmin.storage
+            .from('document-files')
+            .getPublicUrl(storagePath);
+
+          await supabaseAdmin
+            .from('documents')
+            .update({ file_url: publicUrlData.publicUrl })
+            .eq('id', doc.id);
+        }
+
         send({ type: 'total', total: chunks.length });
 
         for (let i = 0; i < chunks.length; i++) {
-          const embedding = await embedText(chunks[i], 'RETRIEVAL_DOCUMENT');
+          const embedding = await embedText(chunks[i].content, 'RETRIEVAL_DOCUMENT');
           const { error: chunkError } = await supabaseAdmin.from('chunks').insert({
             document_id: doc.id,
-            content: chunks[i],
+            content: chunks[i].content,
+            page: chunks[i].page,
+            chunk_order: i,
             embedding,
           });
           if (chunkError) throw chunkError;
